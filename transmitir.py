@@ -11,7 +11,7 @@ Ordem, igual às fotos da cliente:
 from __future__ import annotations
 
 # EMITE_NOTAS_ROBO
-ROBO_VERSAO = "2026-11-25.2"
+ROBO_VERSAO = "2026-11-25.3"
 
 import argparse
 import json
@@ -371,8 +371,35 @@ def salvar_recibo(aba, chave: str) -> bool:
     return destino.is_file() and destino.stat().st_size > 500
 
 
-def recolher_recibos(page, somente: set[int] | None = None) -> None:
+def registrar_recibo(comprovante: str, destino: Path, numero: int | None) -> None:
+    """Grava qual venda é dona deste PDF e avisa o aplicativo, sem parar as outras notas."""
+    comprovante = str(comprovante or "").strip()
+    if not comprovante or not destino.is_file():
+        return
+    indice = PASTA_NOTAS / "indice.json"
+    try:
+        dados = json.loads(indice.read_text(encoding="utf-8"))
+    except Exception:
+        dados = {}
+    if not isinstance(dados, dict):
+        dados = {}
+    dados[comprovante] = str(destino)
+    try:
+        indice.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    emit(
+        "recibo",
+        comprovante=comprovante,
+        arquivo=str(destino),
+        nfce=numero,
+        msg=f"Recibo da NFC-e {numero} disponível na lista.",
+    )
+
+
+def recolher_recibos(page, somente: set[int] | None = None, comprovante: str | None = None) -> None:
     """Salva o DANFE e fecha a aba. A aba do ZWeb volta para a lista."""
+    nota_deste = min(somente) if somente and comprovante else None
     for aba in list(_paginas(page)):
         try:
             chave = chave_danfe(aba.url or "")
@@ -391,6 +418,8 @@ def recolher_recibos(page, somente: set[int] | None = None) -> None:
         if not salvo:
             emit("log", msg=f"Não consegui salvar o recibo da NFC-e {numero}. A aba continua aberta.")
             continue
+        if nota_deste is not None and numero == nota_deste:
+            registrar_recibo(comprovante or "", PASTA_NOTAS / f"{chave}.pdf", numero)
         if aba is page:
             emit("log", msg=f"Recibo da NFC-e {numero} salvo em Notas_emitidas. Voltando à lista.")
             page.goto("https://zweb.com.br/#/fiscal/nfce", wait_until="domcontentloaded")
@@ -442,7 +471,7 @@ def esperar_nota_na_lista(
         if novos:
             numero = min(novos)
             emit("log", msg=f"Nota {numero} autorizada no DANFE.")
-            recolher_recibos(page, novos)
+            recolher_recibos(page, novos, comprovante=str(nota.get("comprovante") or ""))
             return
         if not na_lista_nfce(page.url or ""):
             page.wait_for_timeout(600)
@@ -459,7 +488,11 @@ def esperar_nota_na_lista(
                     "log",
                     msg=f"Nota {linha['numero']} autorizada na lista ({linha['total']}).",
                 )
-                recolher_recibos(page)
+                recolher_recibos(
+                    page,
+                    {int(linha["numero"])},
+                    comprovante=str(nota.get("comprovante") or ""),
+                )
                 return
             if any(p in status for p in ("rejeit", "deneg", "erro")):
                 cod = _bloquear_item_rejeitado(linha["status"], itens)
