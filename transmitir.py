@@ -8,10 +8,10 @@ Ordem, igual às fotos da cliente:
 4. Para. O botão Transmitir não é clicado.
 """
 
-# EMITE_NOTAS_ROBO
-ROBO_VERSAO = "2026-11-25.1"
-
 from __future__ import annotations
+
+# EMITE_NOTAS_ROBO
+ROBO_VERSAO = "2026-11-25.2"
 
 import argparse
 import json
@@ -1152,6 +1152,8 @@ def _fechar_restante(restante: int, opcoes: list[dict], usados_nota: set[str], e
         viaveis.append((opcao, plano))
     if not viaveis:
         return None
+    menor = min(plano["descontoCentavos"] for _, plano in viaveis)
+    viaveis = [(opcao, plano) for opcao, plano in viaveis if plano["descontoCentavos"] == menor]
     pesos = _pesos(
         [opcao for opcao, _ in viaveis],
         usados_nota,
@@ -1262,13 +1264,24 @@ def montar_linhas(alvo: int, opcoes: list[dict], evitar: set[str] | None = None)
             usados_nota.discard(ultima["busca"])
 
 
+def _sobra_para_fechar(preco: int, alvo: int) -> int:
+    """Quanto de desconto uma quantidade desse preço deixa para bater o valor."""
+    if preco <= 0:
+        return 10**9
+    resto = alvo % preco
+    return 0 if resto == 0 else preco - resto
+
+
+def _desconto_total(plano: list[dict]) -> int:
+    return sum(int(linha.get("descontoCentavos") or 0) for linha in plano)
+
+
 def resolver_itens(page, sec, nota: dict, catalogo: list) -> list[dict]:
     alvo = int(nota["brutoCentavos"])
     evitar = usados_do_valor(alvo)
     ruins = ncm_ruins()
     freqs: dict[str, int] = {}
     ordem = []
-    cota = max(1, alvo // linhas_desejadas(alvo))
     for p in catalogo or []:
         cod = str(p.get("busca") or "").strip()
         preco = int(p.get("centavos") or 0)
@@ -1276,14 +1289,21 @@ def resolver_itens(page, sec, nota: dict, catalogo: list) -> list[dict]:
             continue
         freq = max(0, min(100, int(p.get("frequencia") or 0)))
         freqs[cod] = freq
-        ordem.append((0 if freq > 0 else 1, 0 if cod not in evitar else 1, -freq, abs(preco - cota), preco, cod))
+        ordem.append((
+            _sobra_para_fechar(preco, alvo),
+            0 if freq > 0 else 1,
+            0 if cod not in evitar else 1,
+            -freq,
+            preco,
+            cod,
+        ))
     ordem.sort()
     soma_freq = sum(freqs.values())
     tem_freq = soma_freq > 0
     fav_total = sum(1 for v in freqs.values() if v > 0)
     cache: dict = {}
     pool: list[dict] = []
-    plano = None
+    melhor: list[dict] | None = None
     fav_consultados = 0
     comuns = 0
     limite = min(len(ordem), 24 if tem_freq else 18)
@@ -1292,10 +1312,15 @@ def resolver_itens(page, sec, nota: dict, catalogo: list) -> list[dict]:
         if cod in ruins:
             emit("log", msg=f"{cod} ficou de fora: a Sefaz rejeitou o NCM desse produto.")
             continue
-        if freqs.get(cod, 0) > 0:
-            fav_consultados += 1
         info = consultar_estoque(page, sec, cod, cache)
-        if info is None or float(info["estoque"]) < 1 or int(info["preco"] or 0) <= 0:
+        if info is not None and int(info["preco"] or 0) <= 0:
+            if indice < limite:
+                emit("log", msg=f"{cod} {info['nome']} está sem preço no ZWeb e ficou de fora.")
+            elif not avisou_resto:
+                emit("log", msg="Os primeiros códigos não fecham a nota. Procurando o restante do catálogo.")
+                avisou_resto = True
+            continue
+        if info is None or float(info["estoque"]) < 1:
             if indice < limite:
                 emit(
                     "log",
@@ -1309,6 +1334,8 @@ def resolver_itens(page, sec, nota: dict, catalogo: list) -> list[dict]:
                 emit("log", msg="Os primeiros códigos não fecham a nota. Procurando o restante do catálogo.")
                 avisou_resto = True
             continue
+        if freqs.get(cod, 0) > 0:
+            fav_consultados += 1
         item = dict(info)
         item["frequencia"] = freqs.get(cod, 0)
         pool.append(item)
@@ -1317,18 +1344,17 @@ def resolver_itens(page, sec, nota: dict, catalogo: list) -> list[dict]:
         plano = montar_linhas(alvo, pool, evitar)
         if plano is None:
             continue
-        if indice >= limite:
+        if melhor is None or _desconto_total(plano) < _desconto_total(melhor):
+            melhor = plano
+        if _desconto_total(plano) == 0:
             break
-        if tem_freq:
-            if fav_consultados >= min(fav_total, 8) and (soma_freq >= 100 or comuns >= 6):
+        if indice >= limite and melhor is not None and _desconto_total(melhor) <= 30:
+            break
+        if tem_freq and fav_consultados >= min(fav_total, 8) and (soma_freq >= 100 or comuns >= 6):
+            if melhor is not None and _desconto_total(melhor) == 0:
                 break
             continue
-        meta = linhas_desejadas(alvo)
-        fresco = any(linha["busca"] not in evitar for linha in plano)
-        if len(plano) >= meta and (fresco or len(pool) >= 8):
-            break
-        if meta == 1 and fresco:
-            break
+    plano = melhor
     if not plano:
         raise RuntimeError(
             f"Não achei produtos com estoque para fechar {centavos_campo(alvo)}."
